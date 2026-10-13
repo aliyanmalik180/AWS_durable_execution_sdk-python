@@ -1,0 +1,111 @@
+# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+
+name: Python package
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ main ]
+
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-commits:
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    # Fork PRs stay on GitHub-hosted runners so fork code never executes inside
+    # the testing account; same-repo PRs go to the CodeBuild-hosted runner
+    # (label must match the CodeBuild project name exactly).
+    runs-on: ${{ github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    env:
+      # The runner image ships /etc/pip.conf with `[global] target =
+      # /tmp/opt/python/site-packages` and puts that directory on PYTHONPATH, so
+      # every pip install (including Hatch's env installs) would land in one
+      # shared directory. Ignore both so each environment stays isolated.
+      PIP_CONFIG_FILE: /dev/null
+      PYTHONPATH: ""
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      with:
+        fetch-depth: 0
+    - name: Set up Python
+      # The runner image is Amazon Linux; actions/setup-python only ships Ubuntu
+      # builds, so uv provides the interpreter and activates a venv.
+      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        python-version: "3.12"
+        activate-environment: true
+    - name: Lint commit messages
+      env:
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: python .github/scripts/lintcommit.py --range "${PR_BASE_SHA}..${PR_HEAD_SHA}"
+
+  build:
+    # Fork and Dependabot PRs stay on GitHub-hosted runners so untrusted code
+    # never executes inside the testing account; same-repo PRs and pushes go to
+    # the CodeBuild-hosted runner (label must match the CodeBuild project name
+    # exactly).
+    runs-on: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || github.actor == 'dependabot[bot]') && 'ubuntu-latest' || format('codebuild-github-actions-runner-{0}-{1}', github.run_id, github.run_attempt) }}
+    env:
+      # The runner image ships /etc/pip.conf with `[global] target =
+      # /tmp/opt/python/site-packages` and puts that directory on PYTHONPATH, so
+      # every pip install (including Hatch's env installs) would land in one
+      # shared directory. Ignore both so each environment stays isolated.
+      PIP_CONFIG_FILE: /dev/null
+      PYTHONPATH: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11","3.12","3.13","3.14"]
+
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        python-version: ${{ matrix.python-version }}
+        activate-environment: true
+    - name: Install Hatch
+      run: uv pip install hatch==1.16.5
+    - name: static analysis
+      run: |
+        for pkg in packages/*/; do
+          if [ -f "$pkg/pyproject.toml" ]; then
+            echo "=== Checking format: $pkg ==="
+            cd "$pkg"
+            hatch fmt --check
+            cd "$GITHUB_WORKSPACE"
+          fi
+        done
+    - name: type checking
+      run: hatch run types:check
+    - name: Run tests + coverage
+      run: hatch run test:cov
+    - name: Build distribution
+      run: |
+        for pkg in packages/*/; do
+          if [ -f "$pkg/pyproject.toml" ]; then
+            echo "=== Building: $pkg ==="
+            cd "$pkg"
+            hatch build
+            cd "$GITHUB_WORKSPACE"
+          fi
+        done
+    - name: Test installed core and OTel wheels
+      run: hatch run test-wheel-otel:test
+    - name: Test released OTel with the new core wheel
+      run: hatch run test-wheel-otel-legacy:test
+    - name: Verify OTel wheel dependency contract
+      run: |
+        OTEL_WHEEL=$(find packages/aws-durable-execution-sdk-python-otel/dist \
+          -name 'aws_durable_execution_sdk_python_otel-*.whl' -print -quit)
+        python .github/scripts/check_otel_wheel_dependencies.py "$OTEL_WHEEL"
+    - name: Verify legal files in published distributions
+      run: |
+        python .github/scripts/check_dist_legal_files.py \
+          packages/aws-durable-execution-sdk-python \
+          packages/aws-durable-execution-sdk-python-otel \
+          packages/aws-durable-execution-sdk-python-testing

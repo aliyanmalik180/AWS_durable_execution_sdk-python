@@ -1,0 +1,483 @@
+# AWS Durable Execution SDK - OpenTelemetry Plugin
+
+OpenTelemetry instrumentation plugin for the [AWS Durable Execution SDK for Python](https://github.com/aws/aws-durable-execution-sdk-python). Emits durable execution spans on one execution trace, with deterministic workflow, synthetic-root, and operation span IDs.
+
+## Features
+
+- **Shared Execution Trace**: Workflow and Invocation spans share one trace, anchored to a propagated backend parent when available or a deterministic synthetic execution root otherwise
+- **Same-Trace Ambient Parenting**: Invocation spans use the active ambient span only when it already belongs to the execution trace
+- **Span-per-Operation**: Each durable operation (step, wait, invoke) gets its own span with accurate timing
+- **Continuation Spans**: Operations completing in another invocation produce a new correlated span without fabricating an unobserved prior span context
+- **Log Correlation**: Enrich application logs with trace ID and span ID for end-to-end observability
+- **Provider Integration**: Use the global ADOT provider or supply an explicit SDK `TracerProvider`
+- **Execution Sampling**: Resolve sampling once per invocation and apply it consistently to Workflow, Invocation, operation, and attempt spans
+
+## Installation
+
+When using an ADOT or community OpenTelemetry Lambda layer:
+
+```bash
+pip install aws-durable-execution-sdk-python-otel
+```
+
+The base package intentionally does not install OpenTelemetry libraries. The
+Lambda layer supplies a version-aligned API, SDK, exporter, and propagators,
+preventing packages in the function artifact from shadowing parts of the layer.
+
+For an application that configures its own OpenTelemetry provider instead of
+using a Lambda layer:
+
+```bash
+pip install "aws-durable-execution-sdk-python-otel[standalone]"
+```
+
+The `standalone` extra installs the OpenTelemetry API, SDK, and AWS X-Ray
+propagator. The application remains responsible for configuring its provider,
+processors, and exporter.
+
+## Quick Start using X-Ray/CloudWatch Tracing
+
+1. Add the [ADOT Lambda Layer](#1-adot-lambda-layer) to your function and set `AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument`
+2. Enable [X-Ray Active Tracing](#2-aws-x-ray-active-tracing) on the function
+3. Pass `InvocationOtelPlugin` to your handler's `plugins` list
+4. Add X-Ray write permissions
+
+Alternatively, install this package in the function artifact or a Lambda layer
+and select either OTel plugin by entry-point name:
+
+```text
+DURABLE_EXECUTION_PLUGINS=otel-invocation
+DURABLE_EXECUTION_PLUGINS=otel-execution
+```
+
+`otel-invocation` creates `InvocationOtelPlugin`; `otel-execution` creates
+`ExecutionOtelPlugin`. The SDK discovers the selected package entry point at
+cold start, so the handler does not need to import or explicitly register the
+plugin.
+
+OTel 1.1.0 requires core SDK 2.1.0 or later for the invocation-worker lifecycle
+and automatic mutual-exclusion validation. Publish the redesigned core first,
+then the plugin. Core 2.0.x runs invocation hooks on the caller and cannot provide
+the new plugin's handler propagation and host-context isolation; that version
+pair is not supported by OTel 1.1.0.
+Configure only one OTel view on every core version. `InvocationOtelPlugin`
+shows work within each Lambda invocation; `ExecutionOtelPlugin` shows logical
+operations across the whole execution. They emit overlapping telemetry and
+manage competing active contexts, so the coordinated core 2.1+/OTel 1.1+ pair
+rejects both at cold start with `PluginLoadError` naming both views. Keep only one across the combined
+`plugins=[...]` and `DURABLE_EXECUTION_PLUGINS` configuration. Unrelated plugins
+may run alongside the selected view; using no OTel plugin is also supported.
+
+The bundled views explicitly declare `__durable_registration_api__ = 1`.
+Custom subclasses inherit their group validation and registration cleanup.
+The closest marker gates registration and selects the callback contract; an
+explicit value other than the integer `1` shadows the inherited opt-in.
+Once enabled, each MRO class explicitly declaring the integer `1` contributes
+its resolved `exclusive_group`. A subclass's own group adds to the inherited
+view group rather than replacing it; `None` cannot remove an inherited group.
+Repeated groups count once per plugin. Unmarked classes' unrelated fields/helpers
+named `exclusive_group` or `on_registration_result` remain inert. Repeat the marker
+to add a group or customize the callback, which is still notified once per plugin.
+Re-accepting a previously rejected bundled instance
+restores its constructor-time logger enrichment immediately.
+
+### 1. ADOT Lambda Layer
+
+This plugin requires the [AWS Distro for OpenTelemetry (ADOT) Lambda layer](https://aws-otel.github.io/docs/getting-started/lambda) to export traces from your Lambda function.
+
+The layer ARN follows the format:
+
+```
+arn:aws:lambda:<region>:<awsAccountId>:layer:aws-otel-python-<arch>-ver-<version>
+```
+
+Refer to the [ADOT Lambda Layer ARNs](https://aws-otel.github.io/docs/getting-started/lambda/lambda-python) page for the latest version number, architecture, and supported regions.
+
+**AWS CLI:**
+
+```bash
+aws lambda update-function-configuration \
+  --function-name your-function-name \
+  --layers "arn:aws:lambda:<region>:<awsAccountId>:layer:aws-otel-python-amd64-ver-<version>"
+```
+
+You must also set the `AWS_LAMBDA_EXEC_WRAPPER` environment variable:
+
+```bash
+aws lambda update-function-configuration \
+  --function-name your-function-name \
+  --environment "Variables={AWS_LAMBDA_EXEC_WRAPPER=/opt/otel-instrument}"
+```
+
+> **Note:** Replace `<region>` with your function's region and `<version>`/`<arch>` with the latest layer version and architecture from the ADOT docs.
+
+**CloudFormation / SAM:**
+
+```yaml
+MyFunction:
+  Type: AWS::Serverless::Function
+  Properties:
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:<awsAccountId>:layer:aws-otel-python-amd64-ver-<version>
+    Environment:
+      Variables:
+        AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+```
+
+**CDK:**
+
+```python
+from aws_cdk import aws_lambda as lambda_
+
+adot_layer = lambda_.LayerVersion.from_layer_version_arn(
+    self,
+    "AdotLayer",
+    f"arn:aws:lambda:<region>:<awsAccountId>:layer:aws-otel-python-amd64-ver-<version>",
+)
+
+fn = lambda_.Function(
+    self,
+    "MyFunction",
+    runtime=lambda_.Runtime.PYTHON_3_12,
+    handler="index.handler",
+    code=lambda_.Code.from_asset("lambda"),
+    layers=[adot_layer],
+    environment={"AWS_LAMBDA_EXEC_WRAPPER": "/opt/otel-instrument"},
+)
+```
+
+> **Tip:** Pin the layer version to a specific number in production deployments to avoid unexpected behavior from automatic version changes.
+
+### 2. AWS X-Ray Active Tracing
+
+Enable active tracing on your Lambda function so the `_X_AMZN_TRACE_ID` environment variable is populated at invocation time. The plugin uses this header to anchor the execution trace on the propagated X-Ray `Root`/`Parent` when both are valid, and preserves `Sampled=1` or `Sampled=0` as the backend sampling decision.
+
+**AWS Console:** Lambda → Configuration → Monitoring and operations tools → Active tracing → Enable
+
+**AWS CLI:**
+
+```bash
+aws lambda update-function-configuration \
+  --function-name your-function-name \
+  --tracing-config Mode=Active
+```
+
+**CloudFormation / SAM:**
+
+```yaml
+MyFunction:
+  Type: AWS::Lambda::Function
+  Properties:
+    TracingConfig:
+      Mode: Active
+```
+
+**CDK:**
+
+```python
+lambda_.Function(
+    self,
+    "MyFunction",
+    tracing=lambda_.Tracing.ACTIVE,
+)
+```
+
+### Handler context propagation
+
+The core runs the existing Start hooks, handler, output preparation, resource
+cleanup and End hooks on one invocation worker. Start finishes before checkpoint
+processing begins. End follows registered-branch joins and checkpoint shutdown,
+and output serialization or checkpoint errors retain their normal classification.
+There is no separate handler-context plugin API.
+
+During Start, Invocation view preserves a valid active span on the canonical
+execution trace; when it is absent or unrelated, it attaches the Invocation span.
+Execution view attaches the Workflow span, including when an incoming span is on
+the same trace. The Invocation span's own ambient parenting is separate from the
+active context supplied to handler instrumentation. Both views preserve baggage.
+
+Start hooks run in registration order. A later successful plugin that deliberately
+sets or clears the active span wins; OTel does not apply a second correction pass.
+Place OTel after a span-replacing plugin when OTel's view-specific context is
+desired. Baggage-only plugins that extend the current context can appear on either
+side. The SDK also copies the coordinator's current bindings for each `map` or
+`parallel` branch admission/resume when plugins are registered. Baggage and
+other successful bindings reach these SDK-managed callbacks, while a branch's
+changes cannot leak into siblings, the coordinator or a reused worker.
+End hooks also retain registration order and reset tokens in their owning
+Context; they do not promise a reverse-stack observation of other plugins' spans.
+Existing registration, factory lifetime and checkpoint formats are unchanged.
+
+Upgrade both core to 2.1+ and OTel to 1.1+ for these guarantees. The released
+OTel 1.0 plugin can run on the new core with worker/host isolation, but its
+Invocation view does not attach the new fallback; a core-only upgrade does not
+supply that plugin behavior. CI tests the new pair as installed wheels and tests
+the actual released plugin separately, including before core 2.1 is on PyPI.
+
+### 3. In your Lambda handler (index.py)
+
+```python
+from aws_durable_execution_sdk_python import DurableContext
+from aws_durable_execution_sdk_python.execution import durable_execution
+from aws_durable_execution_sdk_python_otel import InvocationOtelPlugin
+
+
+@durable_execution(plugins=[InvocationOtelPlugin()])
+def handler(event: dict, context: DurableContext) -> dict:
+    result = context.step(lambda _: fetch_data(event["id"]), name="fetch-data")
+
+    context.wait(duration=Duration.from_seconds(5))
+
+    context.step(lambda _: process(result), name="process")
+
+    return result
+```
+
+The ADOT layer supplies the global `TracerProvider`; the plugin handles
+deterministic ID generation and span lifecycle.
+
+### 4. Grant Permissions
+
+The function's execution role needs the `AWSXRayDaemonWriteAccess` managed policy (or equivalent permissions) if using X-Ray as the tracing backend.
+
+### Environment Variables for ADOT layer
+
+| Variable                      | Description                                                                                   | Default           |
+| ----------------------------- | --------------------------------------------------------------------------------------------- | ----------------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Endpoint for the OTLP exporter (e.g., `http://localhost:4318` for the ADOT collector sidecar) | Set by ADOT layer |
+| `AWS_LAMBDA_EXEC_WRAPPER`     | Set to `/opt/otel-instrument` for the ADOT layer to instrument your function                  | —                 |
+| `OTEL_TRACES_SAMPLER`         | Sampler to use (e.g., `traceidratio` for ratio-based sampling)                                | `always_on`       |
+| `OTEL_TRACES_SAMPLER_ARG`     | Argument for the sampler (e.g., `0.3` to sample 30% of traces)                                | —                 |
+
+See the [ADOT sampling configuration](https://aws-otel.github.io/docs/getting-started/lambda#sampling-configuration) for more details. When the backend header contains an explicit `Sampled` value, that backend decision takes precedence over local sampler configuration for durable spans.
+
+## Configuration
+
+### Plugin Options
+
+```python
+from aws_durable_execution_sdk_python_otel import (
+    InvocationOtelPlugin,
+    OtelPluginConfig,
+    xray_context_extractor,
+)
+
+plugin = InvocationOtelPlugin(
+    OtelPluginConfig(
+        # Use a custom context extractor (default: xray_context_extractor).
+        context_extractor=xray_context_extractor,
+        # Custom instrumentation scope name
+        # (default: "aws-durable-execution-sdk-python").
+        instrument_name="my-service",
+        # Install a root-logger filter that stamps trace context onto every
+        # log record (default: True).
+        enrich_logger=True,
+    )
+)
+```
+
+### Context Extractors
+
+Context extractors return an `ExtractedContext` object, or `None` when no
+durable execution trace context is available. The object carries:
+
+- `trace_id`: 128-bit OpenTelemetry trace ID
+- `parent_span_id`: 64-bit OpenTelemetry parent span ID
+- `sampling`: `Sampling.SAMPLED`, `Sampling.NOT_SAMPLED`, or `Sampling.UNDECIDED`
+
+The plugin supports multiple strategies for extracting durable execution trace
+context:
+
+```python
+from aws_durable_execution_sdk_python_otel import (
+    InvocationOtelPlugin,
+    OtelPluginConfig,
+    w3c_client_context_extractor,
+    xray_context_extractor,
+)
+
+# Default: X-Ray trace header (recommended for most Lambda deployments).
+InvocationOtelPlugin(OtelPluginConfig(context_extractor=xray_context_extractor))
+
+# W3C Trace Context via clientContext (placeholder for backend propagation support).
+InvocationOtelPlugin(OtelPluginConfig(context_extractor=w3c_client_context_extractor))
+```
+
+Custom extractors should return `ExtractedContext`, not an OpenTelemetry
+`Context`.
+
+### Trace Structure
+
+Both bundled plugins use the same execution ancestor:
+
+- a propagated backend parent when `_X_AMZN_TRACE_ID` contains a valid `Root`
+  and `Parent`
+- otherwise a deterministic, non-recording synthetic root derived from the
+  durable execution ARN
+
+`InvocationOtelPlugin` keeps durable operation spans under the Invocation span
+and links operations to Workflow:
+
+```text
+Execution ancestor
+├── Workflow
+└── Invocation
+    └── operation
+        └── operation attempt 1
+```
+
+`ExecutionOtelPlugin` keeps operation spans under Workflow and links operations
+to the current Invocation span:
+
+```text
+Execution ancestor
+├── Workflow
+│   └── operation
+│       └── operation attempt 1
+└── Invocation
+```
+
+If an ambient Lambda span is active and already has the execution trace ID, the
+Invocation span uses that ambient span as its parent. Ambient spans on a
+different trace are ignored for durable parenting so Invocation remains on the
+execution trace.
+
+### Sampling
+
+Sampling is resolved once per invocation and carried to every durable span in
+that invocation. Precedence is:
+
+1. `Sampled=1` or `Sampled=0` from `_X_AMZN_TRACE_ID`
+2. a same-trace ambient span's recording/sampled state
+3. the configured OpenTelemetry sampler
+
+The resolved decision is applied to Workflow, Invocation, operation, and attempt
+spans. This avoids independently querying stateful or ratio-based samplers for
+each durable span in the same invocation.
+
+### Status attributes
+
+`durable.invocation.status` uses `RETRYING` when the core plugin hook reports
+`InvocationStatus.RETRY`. The core enum remains unchanged. Operation spans use
+OTel `OK` only for `SUCCEEDED`, `ERROR` when error details are delivered, and
+`UNSET` for other outcomes without error details, including `FAILED`,
+`CANCELLED`, `TIMED_OUT`, and `STOPPED`. The original durable operation status
+remains in `durable.operation.status`.
+
+### Invocation context isolation
+
+With core 2.1+, invocation hooks and the handler run on one worker in an
+invocation-local Context initialized from the host's bindings. Successful Start
+bindings are visible to later hooks, the handler and resource cleanup. The host's
+bindings remain unchanged after return, even if a plugin fails during Start or
+End. A failed Start's bindings are discarded for subsequent work, while End runs
+in that Start's original Context to preserve token ownership. This isolates
+context-variable bindings; it does not undo mutations to shared objects or
+external side effects. The isolation applies when plugins are registered.
+
+### Log Correlation
+
+When `enrich_logger=True` (the default), the plugin installs a logging filter on
+the root logger at invocation start. The filter stamps the active OTel trace
+context onto every emitted log record using these attributes:
+
+- `traceId`: 32-char hex trace identifier
+- `spanId`: 16-char hex span identifier
+- `otelTraceSampled`: boolean indicating if the trace is sampled
+
+These attributes are only set when a valid span context is active, so any log
+formatter or schema must treat the fields as optional.
+
+## Verification
+
+After deploying your function with the plugin configured:
+
+1. **Invoke your durable function** — trigger at least one execution that includes multiple steps or a wait/resume cycle.
+
+2. **Check the CloudWatch console** — Navigate to CloudWatch → Traces in the AWS Console. You should see an execution trace with:
+   - A "Workflow" span exported on the terminal invocation
+   - An "Invocation" span per invocation
+   - Child spans for each durable operation (named after your step names)
+   - All invocations of the same execution grouped under one trace ID
+
+3. **Check log correlation** — verify that your logs include `traceId` and `spanId` fields matching the spans in X-Ray.
+
+4. **Confirm sampling** — If you set `OTEL_TRACES_SAMPLER=traceidratio` and `OTEL_TRACES_SAMPLER_ARG` to a value less than 1.0, verify that only the expected proportion of traces appear.
+
+5. **Span links** — For operations that span multiple invocations (e.g., after a wait resumes), though span links are set, they are not visualized within the CloudWatch console.
+
+### Troubleshooting
+
+| Symptom                           | Likely Cause                                                    |
+| --------------------------------- | --------------------------------------------------------------- |
+| No traces appear                  | ADOT layer not configured, or `AWS_LAMBDA_EXEC_WRAPPER` not set |
+| Traces appear but are fragmented  | Backend trace context is not propagated to every invocation     |
+| Missing spans for some operations | `OTEL_TRACES_SAMPLER_ARG` set below 1.0                         |
+| `_X_AMZN_TRACE_ID` not populated  | X-Ray active tracing not enabled                                |
+
+## API Reference
+
+### `InvocationOtelPlugin`
+
+Invocation-rooted view. Implements `DurableInstrumentationPlugin` from `aws_durable_execution_sdk_python`.
+
+```python
+InvocationOtelPlugin(
+    OtelPluginConfig(
+        tracer_provider=None,
+        context_extractor=None,
+        instrument_name="aws-durable-execution-sdk-python",
+        enrich_logger=True,
+        workflow_span_name="Workflow",
+    )
+)
+```
+
+Pass `tracer_provider=...` when the application owns the OpenTelemetry SDK
+provider. When omitted, the globally configured provider is used.
+
+### `ExecutionOtelPlugin`
+
+Execution-rooted view. Uses the same execution ancestor and sampling behavior as
+`InvocationOtelPlugin`, but parents operation spans under Workflow and links
+them to Invocation.
+
+### `DeterministicIdGenerator`
+
+A custom OpenTelemetry `IdGenerator` that produces reproducible trace and span IDs from execution metadata. Exported for advanced use cases.
+
+### `xray_context_extractor`
+
+Default context extractor. Reads the `_X_AMZN_TRACE_ID` environment variable and
+returns `ExtractedContext` containing parsed `Root`, `Parent`, and `Sampled`
+fields when present.
+
+### `w3c_client_context_extractor`
+
+Alternative context extractor placeholder. Returns `None` until backend W3C
+`traceparent` propagation is supported.
+
+### `ContextExtractor`
+
+Type alias for custom context extractor functions:
+`Callable[[InvocationStartInfo], ExtractedContext | None]`.
+
+### `ExtractedContext` / `Sampling`
+
+Structured trace context and sampling decision returned by context extractors.
+
+### `OtelContextLogFilter` / `install_log_filter`
+
+The logging filter (and its installer) used to stamp trace context onto log
+records. Installed automatically when `enrich_logger=True`; exported for manual
+setups.
+
+## Requirements
+
+- Python >= 3.11
+- `aws-durable-execution-sdk-python` >= 2.1.0 (release the redesigned core before OTel 1.1.0)
+- An ADOT/community OpenTelemetry Lambda layer, or the `standalone` extra
+
+## License
+
+Apache-2.0

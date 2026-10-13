@@ -1,0 +1,629 @@
+# Contributing Guidelines
+
+Thank you for your interest in contributing to our project. Whether it's a bug report, new feature, correction, or additional
+documentation, we greatly value feedback and contributions from our community.
+
+Please read through this document before submitting any issues or pull requests to ensure we have all the necessary
+information to effectively respond to your bug report or contribution.
+
+## Dependencies
+Install [hatch](https://hatch.pypa.io/dev/install/).
+
+## Repository Structure
+
+This is a monorepo containing multiple packages under the `packages/` directory:
+
+```
+packages/
+├── aws-durable-execution-sdk-python/              # Core SDK
+│   ├── pyproject.toml
+│   ├── src/
+│   └── tests/
+├── aws-durable-execution-sdk-python-otel/         # OpenTelemetry instrumentation
+│   ├── pyproject.toml
+│   ├── src/
+│   └── tests/
+└── aws-durable-execution-sdk-python-examples/     # Example functions and tests
+    ├── pyproject.toml
+    ├── src/
+    └── test/
+```
+
+The root `pyproject.toml` defines all shared Hatch environments for testing, type checking, and development. Each package's `pyproject.toml` contains only build metadata, publishing configuration, and package-local tool settings (ruff, coverage, pytest markers).
+
+Shared files (`.github/`, `LICENSE`, `CONTRIBUTING.md`, etc.) live at the repository root.
+
+## Developer workflow
+
+All test, type checking, and development commands are run from the **repository root**:
+
+```bash
+# Run all tests across all packages
+hatch run test:all
+
+# Run tests with coverage
+hatch run test:cov
+
+# Type checking across all packages
+hatch run types:check
+
+# Static analysis (per-package, since ruff config is package-local)
+for pkg in packages/*/; do (cd "$pkg" && hatch fmt --check); done
+```
+
+### Per-package development environments
+
+For focused work on a single package, use the `dev-*` environments from the repo root:
+
+```bash
+# Core SDK
+hatch run dev-core:test        # run core SDK tests only
+hatch run dev-core:cov         # run core SDK tests with coverage
+hatch run dev-core:typecheck   # type check core SDK only
+
+# OpenTelemetry package
+hatch run dev-otel:test        # run otel tests only
+hatch run dev-otel:cov         # run otel tests with coverage
+hatch run dev-otel:typecheck   # type check otel only
+
+# Examples
+hatch run dev-examples:test    # run examples tests only
+```
+
+### Installed package compatibility testing
+
+Build the core and OTel distributions with `hatch build` in each package, then run
+these commands from the repository root:
+
+```bash
+hatch run test-wheel-otel:test        # full OTel suite on the two built wheels
+hatch run test-wheel-otel-legacy:test # released OTel 1.0.0 with the built core
+hatch run test-pypi-examples:test     # examples against the published core
+```
+
+The wheel lanes have no editable workspace members. They verify installed source
+bytes and artifact hashes before exercising public handlers. OTel 1.1 requires
+the redesigned core 2.1.0 lifecycle; it no longer claims compatibility with core
+2.0.x. Publish core first. Building both wheels lets CI verify the intended pair
+before that minimum is available on PyPI. The legacy-plugin lane documents the
+actual core-only upgrade: host isolation is provided by the new core, while old
+Invocation OTel does not gain the new fallback. Workspace tests continue to cover
+the complete current implementation with `hatch run dev-otel:test`.
+
+### Package-level commands
+
+Some commands still run from within a package directory:
+
+```bash
+cd packages/aws-durable-execution-sdk-python
+
+# Static analysis with auto-fix
+hatch fmt
+
+# Build distribution
+hatch build
+
+# Examples deployment (from repo root)
+hatch run examples:build
+hatch run examples:generate-sam-template
+sam build --template-file packages/aws-durable-execution-sdk-python-examples/template.generated.json
+AWS_REGION=us-west-2
+ADOT_LAYER_ARN=$(
+  gh api repos/aws-observability/aws-otel-python-instrumentation/releases/latest \
+    --jq .body |
+    awk -F '|' -v region="$AWS_REGION" '
+      $2 ~ "^[[:space:]]*" region "[[:space:]]*$" {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3)
+        print $3
+        exit
+      }
+    '
+)
+sam deploy \
+  --template-file .aws-sam/build/template.yaml \
+  --stack-name python-examples-dev \
+  --resolve-s3 \
+  --no-confirm-changeset \
+  --parameter-overrides \
+    PythonRuntime=python3.13 \
+    FunctionNamePrefix=PythonDev- \
+    LambdaEndpoint=https://lambda.us-west-2.amazonaws.com \
+    LambdaExecutionRoleArn=arn:aws:iam::123456789012:role/example-lambda-role \
+    AdotLayerArn="$ADOT_LAYER_ARN"
+```
+
+After the stack is deployed, use [SAM remote execution commands](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-remote-execution.html) to invoke examples, inspect durable executions, stop executions that go wrong, and manage reusable test events. Pass the generated CloudFormation logical ID from `template.generated.json`; for example, `hello_world.handler` is generated as `HelloWorld`.
+
+```bash
+# Invoke a deployed example with a payload. Durable functions require a qualifier.
+sam remote invoke \
+  --stack-name python-examples-dev \
+  HelloWorld \
+  --event '{"name":"Ada"}' \
+  --parameter 'Qualifier=$LATEST' \
+  --output json
+
+# Start a durable execution asynchronously.
+sam remote invoke \
+  --stack-name python-examples-dev \
+  HelloWorld \
+  --event '{"name":"Ada"}' \
+  --parameter InvocationType=Event \
+  --parameter 'Qualifier=$LATEST' \
+  --durable-execution-name hello-world-dev-run
+
+# Save and reuse a remote test event for an example.
+sam remote test-event put \
+  --stack-name python-examples-dev \
+  HelloWorld \
+  --name hello-world \
+  --file event.json \
+  --force
+sam remote invoke \
+  --stack-name python-examples-dev \
+  HelloWorld \
+  --test-event-name hello-world \
+  --parameter 'Qualifier=$LATEST'
+```
+
+Use the `DurableExecutionArn` returned from an invocation with SAM's durable execution commands:
+
+```bash
+sam remote execution get "$DURABLE_EXECUTION_ARN" --format json
+sam remote execution history "$DURABLE_EXECUTION_ARN" --format table
+sam remote execution stop "$DURABLE_EXECUTION_ARN" \
+  --error-type UserCancellation \
+  --error-message "Stopped during manual troubleshooting"
+```
+
+### CI checks script
+
+There is a convenience script that runs all checks (tests, types, lint) from the root of the repo:
+```
+.github/scripts/ci-checks.sh
+```
+
+This script also validates your commit messages against the [Conventional Commits](https://www.conventionalcommits.org/) format.
+Commit all your changes before you run the check. If your working directory is dirty the script will skip commit message validation with a warning. 
+
+You can also run the commit message check independently:
+```
+hatch run python .github/scripts/lintcommit.py
+```
+
+## Coding Standards
+Consistency is important for maintainability. Please adhere to the house-style of the repo, unless there's a really
+good reason to break pattern.
+
+### General style
+1. Follow the [Python Style Guide by Google](https://google.github.io/styleguide/pyguide.html) in general.
+2. Standardize to [ruff](https://docs.astral.sh/ruff/) formatting and linting rules. CI checks enforce these too.
+3. Avoid pulling in extra runtime dependencies. The only dependency is [boto3](https://boto3.amazonaws.com/). The
+   reason is that this SDK adds size to the AWS Lambda function of the consumer, so we should keep it as light as
+   possible.
+4. Never use `RLock` when `Lock` would do. The reason is to highlight recursive calls that have the potential for deadlocking
+   immediately, so that RLock is a deliberate and considered decision after having considered deadlocking concerns, rather
+   than just the default.
+
+### Organization
+1. Do not allow circular references, even if you can get away with it by using `if TYPE_CHECKING`. Circular references are a
+   sign that the structure of the code is not clear enough. It makes for inefficient memory management and it makes the
+   code harder to understand and follow. Do use `config` and `types` as the lowest-level import if you run into circular
+   reference issues.
+2. Do not use `__init__` files for any meaningful code or even just type declarations. Why? Because the purpose of init is not
+   to serve as a grab-bag of code that doesn't otherwise have a home.
+3. Do not introduce `utils` or `helper` style modules as a grab-bag of ad hoc functions. Introduce domain-specific classes to
+   encapsulate and model logic.
+
+### Data Structures & Typing
+1. Model data structure with immutable classes and precise type hints. (In other words, use frozen dataclasses with exact,
+   narrow type hints.) Do not rely on unstructured dicts. Why immutable? These are inherently thread-safe, and it forces you
+   to think carefully about when and where you need to mutate values.
+
+2. A rare exception to the general rule to prefer immutable classes wherever possible, is `state.ExecutionState`, which maintains
+   the state of the on-going Durable Execution and encapsulates thread-safe state mutations as the execution progresses.
+
+3. Rely on exact and explicit type declarations rather than duck typing. Why? Yes, duck typing is very pythonic. However, this
+   is a complex code-base, and exact and explicit type declarations signal intent clearly so that the type checker can help
+   you catch errors more quickly. LLMs have an easier time understanding the intent of the code with the type hints, and it makes
+   it easier for you to spot mistaken assumptions that the LLMs might make about the code. The other reason is that it makes the
+   experience of developers much easier with intelligent and context-aware autocomplete hints in an IDE.
+
+4. Annotate function and method parameters and return types, including `-> None`, so that mypy checks their bodies. For local
+   variables, rely on type inference when it is precise and evident from the initializer:
+
+```python
+def my_function() -> str:
+    my_var = arb.call(1, 2, 3)
+    return f"arb result: {my_var}"
+```
+
+   Add an explicit local annotation when inference is unavailable, produces `Any`, is too narrow for the intended use, or when
+   the annotation expresses an intentional contract that is not evident from the initializer. Common examples include empty
+   collections, values initialized with `None`, and values returned by untyped dependencies:
+
+```python
+results: list[str] = []
+response: Response | None = None
+payload: Payload = untyped_dependency.load()
+```
+
+5. To update a field in a frozen dataclass, prefer to use a `clone` or `with_field` class method constructor or reinitialization,
+   rather than dataclass `replace`. There is no big technical reason for this, it's more a soft pattern. The philosophy of an update
+   should be more about thoughfully and purposefully creating a _new_ instance than "in-place editing" an existing one.
+
+
+### Initialization and conversion
+1. Class constructors must be light and not do more than initialize the class. In a dataclass you shouldn't even need an `__init__`.
+   Use a `@classmethod` factory method instead to encapsulate more advanced logic. For example, if a class depends on logic that
+   might fail, encapsulate this in a `create` classmethod:
+
+```python
+@dataclass(frozen=True)
+class MyClass:
+    id: str
+    name: str
+    timeout: int
+    
+    @classmethod
+    def create(cls, name: str, timeout: int = 30) -> Config:
+        """Factory contains """
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        
+        # Generate unique ID
+        config_id: str = f"cfg_{uuid.uuid4().hex[:8]}"
+        
+        return cls(id=config_id, name=name, timeout=timeout)
+```
+
+2. Encapsulate conversion logic in a `from_x` factory and `to_x` method on a class.
+
+```python
+@dataclass(frozen=True)
+class WaitOptions:
+    wait_seconds: int = 0
+
+    @classmethod
+    def from_dict(cls, data: MutableMapping[str, Any]) -> WaitOptions:
+        return cls(wait_seconds=data.get("WaitSeconds", 0))
+
+    def to_dict(self) -> MutableMapping[str, Any]:
+        return {"WaitSeconds": self.wait_seconds}
+```
+
+## Set up your IDE
+Point your IDE at the hatch virtual environment to have it recognize dependencies
+and imports. You can use either the root environment (for cross-package work) or a
+per-package dev environment (for focused work).
+
+You can find the path to the hatch Python interpreter like this:
+```
+# From the repo root — use the dev environment for the package you're working on
+hatch env find dev-core
+hatch env find dev-otel
+hatch env find dev-examples
+```
+
+### VS Code
+#### Interpreter
+If you're using VS Code, "Python: Select Interpreter" and use the hatch venv Python interpreter
+as found with the `hatch env find` command.
+
+Kiro and VS Code mangles the interpreter path if it contains spaces, which results in
+errors finding the interpreter. You can create a local .venv file symlink _without_ spaces
+in the path:
+
+```bash
+# From the repo root — symlink the dev environment you want to use
+rm -rf .venv && ln -s "$(hatch env find dev-core)" .venv
+```
+
+When you "Select Interpreter", enter path `./.venv/bin/python`.
+
+You'll have to rerun this command whenever you recreate your hatch envs.
+
+#### Linting
+Hatch uses Ruff for static analysis.
+
+You might want to install the [Ruff extension for VS Code](https://github.com/astral-sh/ruff-vscode)
+to have your IDE interactively warn of the same linting and formatting rules.
+
+These `settings.json` settings are useful:
+```
+{
+  "[python]": {
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.fixAll": "explicit",
+      "source.organizeImports": "explicit"
+    },
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+  "ruff.nativeServer": "on"
+}
+```
+
+## Testing
+### How to run tests
+Run these commands from the **repository root**:
+
+To run all tests across all packages:
+```
+hatch run test:all
+```
+
+To run tests for a specific package:
+```
+hatch run dev-core:test
+hatch run dev-otel:test
+hatch run dev-examples:test
+```
+
+To run a single test file:
+```
+hatch run dev-core:test packages/aws-durable-execution-sdk-python/tests/path_to_test_module.py
+```
+
+To run a specific test in a module:
+```
+hatch run dev-core:test packages/aws-durable-execution-sdk-python/tests/path_to_test_module.py::test_mytestmethod
+```
+
+To run a subset of tests by pattern:
+```
+hatch run test:all -k TEST_PATTERN
+```
+
+This will run tests which contain names that match the given string expression (case-insensitive),
+which can include Python operators that use filenames, class names and function names as variables.
+
+### Debug
+To debug failing tests:
+
+```
+$ hatch test --pdb
+```
+
+This will drop you into the Python debugger on the failed test.
+
+### Writing tests
+Place test files in the `tests/` directory, using file names that end with `_test`.
+
+Mimic the package structure in the src/aws_durable_execution_sdk_python directory.
+Name your module so that src/mypackage/mymodule.py has a dedicated unit test file
+tests/mypackage/mymodule_test.py
+
+### JS SDK examples against the local runner
+
+If you change the testing package, also run the JS SDK's example tests
+against its local runner. You need Node.js 22 or newer:
+
+```
+hatch run dev-testing:js-examples
+```
+
+CI runs the same command on pull requests that change the testing package.
+See [.github/scripts/js_examples/README.md](.github/scripts/js_examples/README.md).
+
+### Conformance tests
+
+Conformance tests verify cross-SDK behavioral parity. The runner and requirement specifications are maintained in a separate repository: [aws-durable-execution-conformance-tests](https://github.com/aws/aws-durable-execution-conformance-tests). The Python handlers live in-repo under `packages/aws-durable-execution-sdk-python-conformance-tests/`, but new requirement IDs must first be registered upstream. Contributors do not need to add conformance tests. If you believe a change warrants one, mention it in your PR description or [open an issue](https://github.com/aws/aws-durable-execution-conformance-tests/issues/new?template=new_requirement.yml) in that repository.
+
+## Examples and Deployment
+
+Run these commands from the **repository root**.
+
+To run examples tests from the repo root:
+```bash
+hatch run dev-examples:test
+```
+
+### Build and Deploy Examples
+```bash
+# Build the shared example bundle with vendored dependencies
+hatch run examples:build
+
+# Generate the SAM template for the full catalog
+hatch run examples:generate-sam-template
+
+# Build and deploy the full stack with SAM
+sam build --template-file packages/aws-durable-execution-sdk-python-examples/template.generated.json
+AWS_REGION=us-west-2
+ADOT_LAYER_ARN=$(
+  gh api repos/aws-observability/aws-otel-python-instrumentation/releases/latest \
+    --jq .body |
+    awk -F '|' -v region="$AWS_REGION" '
+      $2 ~ "^[[:space:]]*" region "[[:space:]]*$" {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3)
+        print $3
+        exit
+      }
+    '
+)
+sam deploy \
+  --template-file .aws-sam/build/template.yaml \
+  --stack-name python-examples-dev \
+  --resolve-s3 \
+  --no-confirm-changeset \
+  --parameter-overrides \
+    PythonRuntime=python3.13 \
+    FunctionNamePrefix=PythonDev- \
+    LambdaEndpoint=https://lambda.us-west-2.amazonaws.com \
+    LambdaExecutionRoleArn=arn:aws:iam::123456789012:role/example-lambda-role \
+    AdotLayerArn="$ADOT_LAYER_ARN"
+
+# Invoke deployed examples, inspect executions, and manage saved test events
+# with SAM remote commands
+sam remote invoke \
+  --stack-name python-examples-dev \
+  HelloWorld \
+  --event '{"name":"Ada"}' \
+  --parameter 'Qualifier=$LATEST'
+sam remote execution get "$DURABLE_EXECUTION_ARN"
+sam remote execution history "$DURABLE_EXECUTION_ARN"
+sam remote execution stop "$DURABLE_EXECUTION_ARN" \
+  --error-type UserCancellation \
+  --error-message "Stopped during manual troubleshooting"
+sam remote test-event list \
+  --stack-name python-examples-dev \
+  HelloWorld
+
+# Clean build artifacts
+hatch run examples:clean
+```
+
+The generated template uses logical IDs derived from handler module names; for example, `hello_world.handler` becomes `HelloWorld`. See the [SAM remote execution command reference](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-remote-execution.html) for the full set of `sam remote invoke`, `sam remote execution`, and `sam remote test-event` options.
+
+## Coverage
+
+From the repository root:
+```
+# All packages combined
+hatch run test:cov
+
+# Per-package coverage
+hatch run dev-core:cov
+hatch run dev-otel:cov
+```
+
+## Linting and type checks
+Type checking (from repo root):
+```
+hatch run types:check
+```
+
+Static analysis (from within a package directory, with auto-fix):
+```
+hatch fmt
+```
+
+To do static analysis without auto-fixes:
+```
+hatch fmt --check
+```
+
+## Reporting Bugs/Feature Requests
+
+We welcome you to use the GitHub issue tracker to report bugs or suggest features.
+
+When filing an issue, please check existing open, or recently closed, issues to make sure somebody else hasn't already
+reported the issue. Please try to include as much information as you can. Details like these are incredibly useful:
+
+* A reproducible test case or series of steps
+* The version of our code being used
+* Any modifications you've made relevant to the bug
+* Anything unusual about your environment or deployment
+
+
+## Contributing via Pull Requests
+Contributions via pull requests are much appreciated. Before sending us a pull request, please ensure that:
+
+1. You are working against the latest source on the *main* branch.
+2. You check existing open, and recently merged, pull requests to make sure someone else hasn't addressed the problem already.
+3. You open an issue to discuss any significant work - we would hate for your time to be wasted.
+
+To send us a pull request, please:
+
+1. Fork the repository.
+2. Modify the source; please focus on the specific change you are contributing. If you also reformat all the code, it will be hard for us to focus on your change.
+3. Write tests for your changes and ensure all tests pass. At minimum, include related **unit tests**. Include **e2e integration tests** (in the `tests/e2e/` directory) when the change affects cross-component behavior, public API surfaces, or end-to-end workflows. For isolated bug fixes where a unit test alone sufficiently covers the fix, integration tests are not required. See the [Testing](#testing) section for details on running tests.
+4. Do **not** add or modify conformance tests without coordinating with the team. Conformance test requirements and the runner live in a separate repository; the Python handlers live in-repo but new requirement IDs must first be registered upstream. If you believe your change warrants a conformance test, please mention it in your PR description or open an issue in the [Conformance Tests repository](https://github.com/aws/aws-durable-execution-conformance-tests/issues/new?template=new_requirement.yml).
+5. Commit to your fork using clear commit messages.
+6. Send us a pull request, answering any default questions in the pull request interface.
+7. Pay attention to any automated CI failures reported in the pull request, and stay involved in the conversation.
+
+### Pull Request Title and Commit Message Format
+
+We follow the [Conventional Commits](https://www.conventionalcommits.org/) specification for PR titles and commit messages. This helps us maintain a clear project history and enables automated tooling.
+
+**Format:** `type: subject`
+
+- **type**: The type of change (required)  
+- **subject**: Brief description of the change (required, max 50 characters)
+
+**Valid types:**
+- `feat`: New features
+- `fix`: Bug fixes
+- `docs`: Documentation changes
+- `test`: Adding or updating tests
+- `refactor`: Code refactoring without functional changes
+- `perf`: Performance improvements
+- `style`: Code style/formatting changes
+- `chore`: Maintenance tasks
+- `ci`: CI/CD changes
+- `build`: Build system changes
+- `deps`: Dependency updates
+
+**Examples:**
+```
+feat: add retry mechanism for operations
+fix: resolve memory leak in execution state
+docs: update API documentation for context
+test: add integration tests for parallel exec
+feat(sdk): implement new callback functionality
+fix(examples): correct timeout handling
+```
+
+**Requirements:**
+- Subject line must be 50 characters or less
+- Body text should wrap at 72 characters for good terminal display
+- Use lowercase for type and scope
+- Use imperative mood in subject ("add" not "added" or "adds")
+- No period at the end of the subject line
+- Use conventional commit message format with clear, concise descriptions
+- Body should provide detailed explanation of changes with bullet points when helpful
+
+**Full commit message example:**
+```
+feat: add retry mechanism for operations
+
+- Implement exponential backoff strategy for transient failures
+- Add configurable retry limits and timeout settings
+- Include comprehensive error logging for debugging
+- Update documentation with retry configuration examples
+
+Resolves issue with intermittent network failures causing
+execution interruptions in production environments.
+```
+
+The PR title will be used as the commit message when your PR is merged, so please ensure it follows this format.
+
+GitHub provides additional document on [forking a repository](https://help.github.com/articles/fork-a-repo/) and
+[creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
+
+
+## Finding contributions to work on
+Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
+
+
+## Code of Conduct
+This project has adopted the [Amazon Open Source Code of Conduct](https://aws.github.io/code-of-conduct).
+For more information see the [Code of Conduct FAQ](https://aws.github.io/code-of-conduct-faq) or contact
+opensource-codeofconduct@amazon.com with any additional questions or comments.
+
+
+## Security issue notifications
+If you discover a potential security issue in this project we ask that you notify AWS/Amazon Security via our [vulnerability reporting page](http://aws.amazon.com/security/vulnerability-reporting/). Please do **not** create a public github issue.
+
+
+## Licensing
+
+See the [LICENSE](LICENSE) file for our project's licensing. We will ask you to confirm the licensing of your contribution.
+
+## References
+
+- [Amazon Open Source Code of Conduct](https://aws.github.io/code-of-conduct) and
+  [Code of Conduct FAQ](https://aws.github.io/code-of-conduct-faq)
+- [AWS SAM remote execution command reference](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-cli-command-reference-sam-remote-execution.html)
+- [AWS Security vulnerability reporting](http://aws.amazon.com/security/vulnerability-reporting/)
+- [boto3 documentation](https://boto3.amazonaws.com/)
+- [Conventional Commits](https://www.conventionalcommits.org/)
+- GitHub documentation for [forking a repository](https://help.github.com/articles/fork-a-repo/) and
+  [creating a pull request](https://help.github.com/articles/creating-a-pull-request/)
+- [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html), including its
+  [guidance for internal variables](https://google.github.io/styleguide/pyguide.html#typing-variables)
+- [Hatch installation guide](https://hatch.pypa.io/dev/install/)
+- [Mypy type inference documentation](https://mypy.readthedocs.io/en/stable/type_inference_and_annotations.html#type-inference)
+- [Ruff documentation](https://docs.astral.sh/ruff/) and
+  [Ruff extension for Visual Studio Code](https://github.com/astral-sh/ruff-vscode)

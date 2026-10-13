@@ -1,0 +1,196 @@
+name: Cloud tests
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      lambda_endpoint:
+        description: "Optional Lambda endpoint URL for deploying and running cloud tests"
+        required: false
+        type: string
+      region:
+        description: "AWS Region for deploying and running cloud tests"
+        required: false
+        default: us-west-2
+        type: string
+
+env:
+  AWS_REGION: ${{ github.event.inputs.region || 'us-west-2' }}
+
+permissions:
+  contents: read
+
+jobs:
+  example-tests:
+    name: example-tests (${{ matrix.python-version }})
+    # 1. Run for non-PR events, such as scheduled runs and manual invocations
+    # 2. For PRs, run only same-repo branches from non-Dependabot actors; forked PRs or Dependabot should not access secrets.
+    if: github.event_name != 'pull_request' || (github.actor != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository)
+    # CodeBuild-hosted runner in the Python testing account (Lambda compute,
+    # Amazon Linux python3.13 image). Fork PRs are already excluded by the `if:`
+    # above, so the plain label is safe. The label must match the CodeBuild
+    # project name exactly.
+    runs-on:
+      - codebuild-github-actions-runner-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # The runner image ships /etc/pip.conf with `[global] target =
+      # /tmp/opt/python/site-packages` on PYTHONPATH, so every pip install
+      # (including Hatch's env installs) would land in one shared directory.
+      # Ignore both so each environment stays isolated.
+      PIP_CONFIG_FILE: /dev/null
+      PYTHONPATH: ""
+    concurrency:
+      group: cloud-tests-${{ matrix.python-prefix }}
+      cancel-in-progress: false
+      queue: max
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.11"
+            python-prefix: Py311
+          - python-version: "3.12"
+            python-prefix: Py312
+          - python-version: "3.13"
+            python-prefix: Py313
+          - python-version: "3.14"
+            python-prefix: Py314
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Setup Python
+      # The runner image is Amazon Linux; actions/setup-python only ships Ubuntu
+      # builds, so uv provides the interpreter and activates a venv.
+      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      with:
+        python-version: ${{ matrix.python-version }}
+        activate-environment: true
+
+    - name: Configure AWS credentials
+      if: github.event_name != 'workflow_dispatch' || github.actor != 'nektos/act'
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        role-to-assume: "${{ secrets.TEST_ROLE_ARN }}"
+        role-session-name: pythonTestingLibraryGitHubIntegrationTest
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Verify AWS test account
+      if: github.event_name != 'workflow_dispatch' || github.actor != 'nektos/act'
+      env:
+        TEST_ACCOUNT_ID: ${{ secrets.TEST_ACCOUNT_ID }}
+      run: |
+        ACTUAL_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        if [ "$ACTUAL_ACCOUNT_ID" != "$TEST_ACCOUNT_ID" ]; then
+          echo "Expected AWS account $TEST_ACCOUNT_ID but assumed into $ACTUAL_ACCOUNT_ID"
+          exit 1
+        fi
+        echo "Using AWS test account $ACTUAL_ACCOUNT_ID"
+
+    - name: Install Hatch
+      run: uv pip install hatch==1.16.5
+
+    - name: Setup SAM CLI
+      uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+
+    - name: Build examples
+      run: |
+        hatch run -- examples:pip install -e packages/aws-durable-execution-sdk-python packages/aws-durable-execution-sdk-python-otel packages/aws-durable-execution-sdk-python-testing
+        hatch run examples:build
+        hatch run examples:generate-sam-template
+
+    - name: Deploy all examples with SAM
+      id: deploy
+      env:
+        LAMBDA_EXECUTION_ROLE_ARN: ${{ secrets.TEST_LAMBDA_EXECUTION_ROLE_ARN }}
+        LAMBDA_ENDPOINT_OVERRIDE: ${{ github.event.inputs.lambda_endpoint || vars.TEST_LAMBDA_ENDPOINT }}
+        PYTHON_RUNTIME: python${{ matrix.python-version }}
+        STACK_NAME: ${{ matrix.python-prefix }}-python-examples
+        FUNCTION_NAME_PREFIX: ${{ matrix.python-prefix }}-
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        echo "Building SAM application"
+        sam build --template-file packages/aws-durable-execution-sdk-python-examples/template.generated.json
+
+        ADOT_LAYER_ARN=$(
+          curl -sSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/aws-observability/aws-otel-python-instrumentation/releases/latest |
+            python3 -c "import sys, json; print(json.load(sys.stdin)['body'])" |
+            awk -F '|' -v region="$AWS_REGION" '
+              $2 ~ "^[[:space:]]*" region "[[:space:]]*$" {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3)
+                print $3
+                exit
+              }
+            '
+        )
+        if [ -z "$ADOT_LAYER_ARN" ]; then
+          echo "Could not resolve the latest ADOT Python layer for $AWS_REGION"
+          exit 1
+        fi
+        # Parallel jobs can throttle this read; keep retries local to the lookup.
+        AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=8 \
+          aws lambda get-layer-version-by-arn \
+          --arn "$ADOT_LAYER_ARN" \
+          --region "$AWS_REGION" \
+          --query LayerVersionArn \
+          --output text > /dev/null
+        echo "Using ADOT Python layer $ADOT_LAYER_ARN"
+
+        PARAMETER_OVERRIDES=(
+          PythonRuntime="$PYTHON_RUNTIME"
+          FunctionNamePrefix="$FUNCTION_NAME_PREFIX"
+          LambdaExecutionRoleArn="$LAMBDA_EXECUTION_ROLE_ARN"
+          AdotLayerArn="$ADOT_LAYER_ARN"
+        )
+        if [ -n "$LAMBDA_ENDPOINT_OVERRIDE" ]; then
+          PARAMETER_OVERRIDES+=(LambdaEndpoint="$LAMBDA_ENDPOINT_OVERRIDE")
+          echo "LAMBDA_ENDPOINT=$LAMBDA_ENDPOINT_OVERRIDE" >> $GITHUB_ENV
+          echo "Using custom Lambda endpoint override"
+        fi
+
+        PYTEST_FUNCTION_NAME_MAP=$(
+          python packages/aws-durable-execution-sdk-python-examples/scripts/generate_function_name_map.py \
+            --function-name-prefix "$FUNCTION_NAME_PREFIX"
+        )
+
+        # TODO: Remove this one-time cleanup after existing CI stacks adopt the
+        # generated AWS::Logs::LogGroup resources.
+        python packages/aws-durable-execution-sdk-python-examples/scripts/cleanup_unmanaged_log_groups.py \
+          --stack-name "$STACK_NAME" \
+          --function-name-prefix "$FUNCTION_NAME_PREFIX" \
+          --region "$AWS_REGION"
+
+        echo "Deploying stack $STACK_NAME with function prefix $FUNCTION_NAME_PREFIX and runtime $PYTHON_RUNTIME"
+        sam deploy \
+          --template-file .aws-sam/build/template.yaml \
+          --stack-name "$STACK_NAME" \
+          --resolve-s3 \
+          --no-confirm-changeset \
+          --no-fail-on-empty-changeset \
+          --region "$AWS_REGION" \
+          --parameter-overrides "${PARAMETER_OVERRIDES[@]}"
+
+        echo "PYTEST_FUNCTION_NAME_MAP=$PYTEST_FUNCTION_NAME_MAP" >> $GITHUB_ENV
+
+    - name: Run Integration Tests
+      run: |
+        echo "Running integration tests for all deployed examples"
+        echo "AWS Region: ${AWS_REGION}"
+        echo "Configured function map: ${PYTEST_FUNCTION_NAME_MAP}"
+
+        mkdir -p .test-results
+        hatch run test:examples-integration -n 8 --dist loadfile --junitxml=.test-results/examples.xml
+
+    - name: Report Test Summary
+      if: always()
+      run: |
+        python packages/aws-durable-execution-sdk-python-examples/scripts/write_junit_summary.py \
+          .test-results/examples.xml \
+          --title "Cloud test summary (Python ${{ matrix.python-version }})" \
+          --output "$GITHUB_STEP_SUMMARY"
