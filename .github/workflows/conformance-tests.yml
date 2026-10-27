@@ -89,7 +89,7 @@ jobs:
     - name: Setup Python
       # The runner image is Amazon Linux; actions/setup-python only ships Ubuntu
       # builds, so uv provides the Python 3.14 interpreter and activates a venv.
-      uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       with:
         python-version: "3.14"
         activate-environment: true
@@ -113,7 +113,7 @@ jobs:
         echo "Using AWS test account $ACTUAL_ACCOUNT_ID"
 
     - name: Setup SAM CLI
-      uses: aws-actions/setup-sam@89ddb14d60e682855e3fea4be85b3c56485de310 # v3
+      uses: aws-actions/setup-sam@341eee193f458fa5aae5d52c94b0c5cf3a1c5a52 # v3
 
     - name: Build conformance handlers
       run: python3 scripts/build_examples.py
@@ -158,7 +158,7 @@ jobs:
 
     - name: Upload conformance report
       if: always()
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: conformance-report-${{ matrix.suite }}
         path: |
